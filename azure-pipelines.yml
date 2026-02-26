@@ -2,6 +2,20 @@
 # azure-pipelines.yml
 # Azure DevOps Pipeline – Terraform CI/CD for ACA + WAF Infrastructure
 #
+# This pipeline implements a 4-stage deployment model:
+#   Validate → Plan → Apply → Smoke Test
+#
+# Why 4 stages instead of a single job?
+#   - Separation of concerns: validation failures stop early without wasting
+#     time on planning. Plan failures stop before any infrastructure changes.
+#   - Artifact passing: the Plan stage produces a binary tfplan file that the
+#     Apply stage consumes. This guarantees that what was reviewed is exactly
+#     what gets applied — no re-planning between approval and execution.
+#   - Approval gates: staging/prod environments require manual approval between
+#     Plan and Apply. This is impossible with a single-job pipeline.
+#   - Smoke testing: a separate stage verifies the deployment independently,
+#     making it clear in the pipeline UI whether infra deployed but isn't healthy.
+#
 # Prerequisites (configure once in ADO):
 #   1. Service Connection: "sc-azure-<env>"  (ARM / Workload Identity Federation)
 #   2. Variable Group  : "vg-terraform-<env>"  containing:
@@ -9,10 +23,13 @@
 #        - TF_BACKEND_RG           (tfstate resource group)
 #        - TF_BACKEND_SA           (storage account name)
 #        - TF_BACKEND_CONTAINER    (blob container, default: tfstate)
-#   3. Azure Storage Account for remote state (pre-created, not managed by Terraform)
-#   4. Self-hosted or Microsoft-hosted agent with: terraform, az CLI, git
+#   3. Azure Storage Account for remote state (created by bootstrap.sh)
+#   4. Microsoft-hosted or self-hosted agent with: terraform, az CLI, git
 ###############################################################################
 
+# Trigger on pushes to main that touch Terraform files.
+# This means merging a PR auto-deploys to dev (with plan → apply → smoke test).
+# Non-Terraform changes (README, docs) don't trigger infrastructure runs.
 trigger:
   branches:
     include:
@@ -21,6 +38,8 @@ trigger:
     include:
       - terraform/**
 
+# Trigger on PRs targeting main — runs Validate + Plan only (no Apply).
+# This gives reviewers a plan diff in the pipeline artifacts before merging.
 pr:
   branches:
     include:
@@ -30,7 +49,11 @@ pr:
       - terraform/**
 
 ###############################################################################
-# Global parameters – override at queue time
+# Global parameters
+# These allow operators to override defaults when manually queuing a run.
+# The "action" parameter controls whether the pipeline plans, applies, or
+# destroys — preventing accidental destroys on automated triggers (default
+# is "plan", which is safe and read-only).
 ###############################################################################
 parameters:
   - name: environment
@@ -47,31 +70,45 @@ parameters:
     type: string
     default: plan
     values:
-      - plan
-      - apply
-      - destroy
+      - plan       # Safe: read-only, no changes made
+      - apply      # Deploys infrastructure changes
+      - destroy    # Tears down all resources — requires approval on staging/prod
 
   - name: terraformVersion
     displayName: Terraform Version
     type: string
     default: "1.7.5"
+    # Pinned version ensures all stages use the same Terraform binary.
+    # Prevents plan/apply drift if a new Terraform version changes behavior.
 
 ###############################################################################
 # Variables
+# Template expressions (${{ }}) are resolved at pipeline compile time, not
+# runtime. This means the environment parameter is baked into variable group
+# names, service connection names, and state keys before any stage runs.
 ###############################################################################
 variables:
   - name: TF_WORKING_DIR
     value: "$(Build.SourcesDirectory)/terraform"
 
+  # Selects the correct .tfvars file for the target environment.
+  # e.g., "terraform.dev.tfvars" for dev, "terraform.prod.tfvars" for prod.
   - name: TF_VARFILE
     value: "terraform.${{ parameters.environment }}.tfvars"
 
-  # Pull secrets from the Variable Group linked in ADO Library
+  # Variable Group contains secrets (subscription ID) and backend config.
+  # Each environment has its own group (vg-terraform-dev, vg-terraform-prod)
+  # to enforce isolation — a dev pipeline run can't accidentally read prod secrets.
   - group: vg-terraform-${{ parameters.environment }}
 
+  # Service connection name follows the same per-environment pattern.
+  # Each connection has RBAC scoped to a single subscription, preventing
+  # cross-environment blast radius.
   - name: SERVICE_CONNECTION
     value: "sc-azure-${{ parameters.environment }}"
 
+  # State file key includes the environment name to keep state files isolated.
+  # dev and prod state are separate blobs in the same (or different) container.
   - name: TF_STATE_KEY
     value: "aca-waf/${{ parameters.environment }}/terraform.tfstate"
 
@@ -82,9 +119,18 @@ stages:
 
   ###########################################################################
   # STAGE 1 – Validate & Security Scan
+  #
+  # Purpose: fast feedback on code quality before committing to a plan.
+  # Runs: terraform fmt (style), terraform validate (syntax/provider checks),
+  #       and tfsec (static security analysis).
+  #
+  # Why run tfsec here and not in a separate stage?
+  #   Validation and security scanning are both fast, read-only operations
+  #   that don't need Azure credentials for the plan. Combining them reduces
+  #   pipeline duration and agent costs.
   ###########################################################################
   - stage: Validate
-    displayName: "🔍 Validate & Security Scan"
+    displayName: "Validate & Security Scan"
     jobs:
       - job: TerraformValidate
         displayName: "Terraform fmt + validate + tfsec"
@@ -92,6 +138,8 @@ stages:
           vmImage: "ubuntu-latest"
 
         steps:
+          # Shallow clone (depth=1) — we only need the current commit's files,
+          # not full history. Saves ~5-10s on large repos.
           - checkout: self
             fetchDepth: 1
 
@@ -100,11 +148,16 @@ stages:
             inputs:
               terraformVersion: ${{ parameters.terraformVersion }}
 
+          # fmt -check exits non-zero if any file isn't formatted.
+          # This enforces consistent style across the team without manual reviews.
           - script: |
               terraform fmt -check -recursive
             displayName: "terraform fmt check"
             workingDirectory: $(TF_WORKING_DIR)
 
+          # terraform validate requires init (to download providers), but we
+          # don't need ARM credentials here — just backend connectivity to
+          # initialize the provider schema.
           - task: AzureCLI@2
             displayName: "terraform init (backend)"
             inputs:
@@ -121,24 +174,45 @@ stages:
                   -input=false
             workingDirectory: $(TF_WORKING_DIR)
 
+          # Validates HCL syntax, provider requirements, and variable references.
+          # Catches errors like missing required variables or invalid resource types
+          # before spending time on a plan.
           - script: |
               terraform validate
             displayName: "terraform validate"
             workingDirectory: $(TF_WORKING_DIR)
 
-          # tfsec – static security analysis for Terraform
+          # tfsec scans for security misconfigurations (e.g., public storage accounts,
+          # missing encryption, overly permissive NSGs). continueOnError=true means
+          # findings are reported as warnings, not blockers. This lets the team triage
+          # findings without blocking every PR. Set to false once the baseline is clean.
           - script: |
               curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
               tfsec . --format lovely --no-color
             displayName: "tfsec security scan"
             workingDirectory: $(TF_WORKING_DIR)
-            continueOnError: true   # Warn but don't block on first run
+            continueOnError: true
 
   ###########################################################################
   # STAGE 2 – Plan
+  #
+  # Purpose: generate the execution plan and save it as a binary artifact.
+  #
+  # Why save the plan as an artifact?
+  #   The plan captures the exact diff between current state and desired state
+  #   at this point in time. If we re-planned in the Apply stage, the state
+  #   could have changed (another pipeline, manual change), leading to
+  #   unexpected modifications. The saved plan guarantees: what you review
+  #   is what gets applied.
+  #
+  # Why export ARM_* environment variables?
+  #   AzureCLI@2 with addSpnToEnvironment injects the Service Principal
+  #   credentials as shell variables ($servicePrincipalId, etc.), but
+  #   Terraform's azurerm provider reads ARM_CLIENT_ID, ARM_CLIENT_SECRET,
+  #   ARM_TENANT_ID. We bridge the gap with export statements.
   ###########################################################################
   - stage: Plan
-    displayName: "📋 Terraform Plan"
+    displayName: "Terraform Plan"
     dependsOn: Validate
     condition: succeeded()
 
@@ -165,7 +239,9 @@ stages:
               scriptLocation: inlineScript
               addSpnToEnvironment: true
               inlineScript: |
-                # Export ARM credentials from Service Principal (for Terraform provider)
+                # Bridge ADO Service Principal credentials to Terraform's expected
+                # ARM_* environment variables. This is required because Terraform
+                # doesn't natively integrate with ADO's credential injection.
                 export ARM_CLIENT_ID=$servicePrincipalId
                 export ARM_CLIENT_SECRET=$servicePrincipalKey
                 export ARM_TENANT_ID=$tenantId
@@ -192,6 +268,9 @@ stages:
                 export ARM_TENANT_ID=$tenantId
                 export ARM_SUBSCRIPTION_ID=$(TF_VAR_subscription_id)
 
+                # -out=tfplan saves the plan as a binary file. This file contains
+                # the full diff and is consumed by `terraform apply tfplan` in the
+                # next stage. -input=false prevents interactive prompts in CI.
                 terraform plan \
                   -var-file="$(TF_VARFILE)" \
                   -var="subscription_id=$(TF_VAR_subscription_id)" \
@@ -199,7 +278,10 @@ stages:
                   -input=false
             workingDirectory: $(TF_WORKING_DIR)
 
-          # Publish plan artifact so Apply stage can consume it
+          # Publish the binary plan as a pipeline artifact so the Apply stage
+          # (which runs on a fresh agent) can download and apply it.
+          # Artifact names are environment-scoped to prevent cross-env collisions
+          # in matrix builds.
           - task: PublishPipelineArtifact@1
             displayName: "Publish tfplan artifact"
             inputs:
@@ -208,10 +290,28 @@ stages:
               publishLocation: "pipeline"
 
   ###########################################################################
-  # STAGE 3 – Apply (manual approval gate on prod)
+  # STAGE 3 – Apply
+  #
+  # Purpose: execute the saved plan against real infrastructure.
+  #
+  # Approval gate logic:
+  #   - dev: no approval required — auto-applies after successful plan.
+  #     Rationale: dev is ephemeral and low-risk, fast iteration matters.
+  #   - staging/prod: ManualValidation@0 task pauses the pipeline until an
+  #     authorized operator approves. The operator reviews the plan artifact
+  #     (uploaded in Stage 2) before clicking "Resume".
+  #   - 60-minute timeout with auto-reject: prevents stale plans from being
+  #     applied hours later when state may have drifted.
+  #
+  # Condition: only runs when action is "apply" or "destroy". A "plan" action
+  # stops after Stage 2 — useful for PR validation and dry runs.
+  #
+  # Destroy path: uses terraform destroy with -auto-approve instead of the
+  # saved plan file (destroy plans can't be saved as artifacts in the same
+  # way). Still requires manual approval on staging/prod.
   ###########################################################################
   - stage: Apply
-    displayName: "🚀 Terraform Apply"
+    displayName: "Terraform Apply"
     dependsOn: Plan
     condition: |
       and(
@@ -223,11 +323,13 @@ stages:
       )
 
     jobs:
-      # Approval gate – only on staging and prod
+      # Conditional approval gate — only injected for staging and prod.
+      # Uses compile-time ${{ if }} so the ManualApproval job doesn't even
+      # exist in the pipeline YAML for dev runs (cleaner UI, faster execution).
       - ${{ if or(eq(parameters.environment, 'prod'), eq(parameters.environment, 'staging')) }}:
         - job: ManualApproval
-          displayName: "⏸ Manual Approval Required"
-          pool: server
+          displayName: "Manual Approval Required"
+          pool: server   # Runs on ADO server (no agent needed for approval tasks)
           timeoutInMinutes: 60
           steps:
             - task: ManualValidation@0
@@ -242,12 +344,14 @@ stages:
                   Verify in the pipeline artifacts tab:
                   - Resources being created / modified / destroyed
                   - No unexpected changes
-                onTimeout: "reject"
+                onTimeout: "reject"   # Stale plans are rejected automatically
 
       - job: TerraformApply
         displayName: "terraform ${{ parameters.action }}"
         pool:
           vmImage: "ubuntu-latest"
+        # On staging/prod, wait for the approval job to succeed before running.
+        # On dev, this dependsOn block is not injected — apply runs immediately.
         ${{ if or(eq(parameters.environment, 'prod'), eq(parameters.environment, 'staging')) }}:
           dependsOn: ManualApproval
           condition: succeeded()
@@ -261,6 +365,9 @@ stages:
             inputs:
               terraformVersion: ${{ parameters.terraformVersion }}
 
+          # Download the plan artifact from Stage 2. This runs on a fresh agent,
+          # so nothing from the Plan stage's filesystem is available — we must
+          # explicitly download the artifact.
           - task: DownloadPipelineArtifact@2
             displayName: "Download tfplan artifact"
             inputs:
@@ -302,19 +409,27 @@ stages:
                 export ARM_SUBSCRIPTION_ID=$(TF_VAR_subscription_id)
 
                 if [ "${{ parameters.action }}" = "destroy" ]; then
+                  # Destroy can't use a saved plan — it must re-read state and
+                  # compute the destruction graph at runtime. -auto-approve skips
+                  # the interactive confirmation (already approved via the gate).
                   terraform destroy \
                     -var-file="$(TF_VARFILE)" \
                     -var="subscription_id=$(TF_VAR_subscription_id)" \
                     -auto-approve \
                     -input=false
                 else
+                  # Apply the exact plan that was reviewed and approved.
+                  # No -var-file needed: the plan file already contains all
+                  # variable values captured at plan time.
                   terraform apply \
                     -input=false \
                     tfplan
                 fi
             workingDirectory: $(TF_WORKING_DIR)
 
-          # Capture outputs and publish as pipeline variables / artifact
+          # After apply, capture Terraform outputs as both:
+          # 1. A JSON artifact (for the Smoke Test stage to read the AGW IP)
+          # 2. A pipeline variable (for downstream jobs in this same stage)
           - task: AzureCLI@2
             displayName: "Capture Terraform outputs"
             inputs:
@@ -331,6 +446,9 @@ stages:
                 echo "=== Infrastructure Outputs ==="
                 terraform output -json | tee $(Build.ArtifactStagingDirectory)/tf-outputs.json
 
+                # Export the App Gateway IP as a pipeline variable using the
+                # ##vso logging command. isOutput=true makes it available to
+                # downstream stages via dependencies.
                 AGW_IP=$(terraform output -raw app_gateway_public_ip)
                 echo "##vso[task.setvariable variable=AGW_PUBLIC_IP;isOutput=true]$AGW_IP"
                 echo "App Gateway Public IP: $AGW_IP"
@@ -344,10 +462,26 @@ stages:
               artifact: "tf-outputs-${{ parameters.environment }}"
 
   ###########################################################################
-  # STAGE 4 – Smoke Test (runs after Apply on non-destroy actions)
+  # STAGE 4 – Smoke Test
+  #
+  # Purpose: verify end-to-end connectivity after deployment.
+  #
+  # Why not just rely on Terraform's success exit code?
+  #   terraform apply reports success when Azure accepts the resource
+  #   configuration, but App Gateway can take 2-5 minutes to fully provision
+  #   its listeners and start routing traffic. A successful apply doesn't
+  #   mean the app is reachable.
+  #
+  # Retry logic: 10 attempts x 30s backoff = 5 minutes of tolerance.
+  #   This covers the typical App Gateway cold-start time without being so
+  #   long that a real failure wastes pipeline minutes. The 10s curl timeout
+  #   prevents hanging on unreachable IPs.
+  #
+  # Only runs on "apply" (not "destroy") — there's nothing to smoke-test
+  # after tearing down infrastructure.
   ###########################################################################
   - stage: SmokeTest
-    displayName: "🧪 Smoke Test"
+    displayName: "Smoke Test"
     dependsOn: Apply
     condition: |
       and(
@@ -362,6 +496,9 @@ stages:
           vmImage: "ubuntu-latest"
 
         steps:
+          # Download the outputs artifact from the Apply stage to get the
+          # App Gateway's public IP. This avoids hard-coding IPs or re-running
+          # Terraform (which would need full credentials and init).
           - task: DownloadPipelineArtifact@2
             displayName: "Download tf-outputs"
             inputs:
@@ -369,20 +506,26 @@ stages:
               path: "$(Pipeline.Workspace)/tf-outputs"
 
           - script: |
+              # Extract the App Gateway IP from the JSON artifact using python3
+              # (available on all ubuntu-latest agents). jq would also work but
+              # python3 is guaranteed to be present.
               AGW_IP=$(cat $(Pipeline.Workspace)/tf-outputs/tf-outputs.json | python3 -c "import sys,json; print(json.load(sys.stdin)['app_gateway_public_ip']['value'])")
               echo "Testing App Gateway at http://$AGW_IP/status/200"
 
-              # Retry up to 10 times (AGW provisioning can take a few minutes)
+              # Retry loop: App Gateway needs time after provisioning before it
+              # starts routing traffic. We poll every 30 seconds up to 10 times
+              # (total window: ~5 minutes). curl's --max-time 10 prevents the
+              # request from hanging indefinitely on an unreachable IP.
               for i in $(seq 1 10); do
                 STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://$AGW_IP/status/200" || echo "000")
                 echo "Attempt $i: HTTP $STATUS"
                 if [ "$STATUS" = "200" ]; then
-                  echo "✅ Smoke test passed"
+                  echo "Smoke test passed"
                   exit 0
                 fi
                 sleep 30
               done
 
-              echo "❌ Smoke test failed after 10 attempts"
+              echo "Smoke test failed after 10 attempts"
               exit 1
-            displayName: "HTTP smoke test"
+            displayName: "HTTP smoke test (retry with 30s backoff)"

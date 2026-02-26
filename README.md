@@ -211,7 +211,6 @@ curl http://$(terraform output -raw app_gateway_public_ip)/get
 
 ## Author
 
-Built by **Przemysław Grzenkowicz** / [Flow64](https://github.com/pgrzenko)  
-Part of the **FLOWer Recruit** platform – ATS Match Engine & Infrastructure Engineering reference implementations.
+Built by **Przemysław Grzenkowicz** as a Cloud Engineering recruitment task.
 
 LinkedIn: [linkedin.com/in/pgrzenkowicz](https://linkedin.com/in/pgrzenkowicz) | GitHub: [github.com/pgrzenko](https://github.com/pgrzenko)
