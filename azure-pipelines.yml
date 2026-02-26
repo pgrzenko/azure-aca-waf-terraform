@@ -1,0 +1,388 @@
+###############################################################################
+# azure-pipelines.yml
+# Azure DevOps Pipeline – Terraform CI/CD for ACA + WAF Infrastructure
+#
+# Prerequisites (configure once in ADO):
+#   1. Service Connection: "sc-azure-<env>"  (ARM / Workload Identity Federation)
+#   2. Variable Group  : "vg-terraform-<env>"  containing:
+#        - TF_VAR_subscription_id  (secret)
+#        - TF_BACKEND_RG           (tfstate resource group)
+#        - TF_BACKEND_SA           (storage account name)
+#        - TF_BACKEND_CONTAINER    (blob container, default: tfstate)
+#   3. Azure Storage Account for remote state (pre-created, not managed by Terraform)
+#   4. Self-hosted or Microsoft-hosted agent with: terraform, az CLI, git
+###############################################################################
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/**
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/**
+
+###############################################################################
+# Global parameters – override at queue time
+###############################################################################
+parameters:
+  - name: environment
+    displayName: Target Environment
+    type: string
+    default: dev
+    values:
+      - dev
+      - staging
+      - prod
+
+  - name: action
+    displayName: Terraform Action
+    type: string
+    default: plan
+    values:
+      - plan
+      - apply
+      - destroy
+
+  - name: terraformVersion
+    displayName: Terraform Version
+    type: string
+    default: "1.7.5"
+
+###############################################################################
+# Variables
+###############################################################################
+variables:
+  - name: TF_WORKING_DIR
+    value: "$(Build.SourcesDirectory)/terraform"
+
+  - name: TF_VARFILE
+    value: "terraform.${{ parameters.environment }}.tfvars"
+
+  # Pull secrets from the Variable Group linked in ADO Library
+  - group: vg-terraform-${{ parameters.environment }}
+
+  - name: SERVICE_CONNECTION
+    value: "sc-azure-${{ parameters.environment }}"
+
+  - name: TF_STATE_KEY
+    value: "aca-waf/${{ parameters.environment }}/terraform.tfstate"
+
+###############################################################################
+# Stages
+###############################################################################
+stages:
+
+  ###########################################################################
+  # STAGE 1 – Validate & Security Scan
+  ###########################################################################
+  - stage: Validate
+    displayName: "🔍 Validate & Security Scan"
+    jobs:
+      - job: TerraformValidate
+        displayName: "Terraform fmt + validate + tfsec"
+        pool:
+          vmImage: "ubuntu-latest"
+
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - task: TerraformInstaller@1
+            displayName: "Install Terraform ${{ parameters.terraformVersion }}"
+            inputs:
+              terraformVersion: ${{ parameters.terraformVersion }}
+
+          - script: |
+              terraform fmt -check -recursive
+            displayName: "terraform fmt check"
+            workingDirectory: $(TF_WORKING_DIR)
+
+          - task: AzureCLI@2
+            displayName: "terraform init (backend)"
+            inputs:
+              azureSubscription: $(SERVICE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                terraform init \
+                  -backend-config="resource_group_name=$(TF_BACKEND_RG)" \
+                  -backend-config="storage_account_name=$(TF_BACKEND_SA)" \
+                  -backend-config="container_name=$(TF_BACKEND_CONTAINER)" \
+                  -backend-config="key=$(TF_STATE_KEY)" \
+                  -input=false
+            workingDirectory: $(TF_WORKING_DIR)
+
+          - script: |
+              terraform validate
+            displayName: "terraform validate"
+            workingDirectory: $(TF_WORKING_DIR)
+
+          # tfsec – static security analysis for Terraform
+          - script: |
+              curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+              tfsec . --format lovely --no-color
+            displayName: "tfsec security scan"
+            workingDirectory: $(TF_WORKING_DIR)
+            continueOnError: true   # Warn but don't block on first run
+
+  ###########################################################################
+  # STAGE 2 – Plan
+  ###########################################################################
+  - stage: Plan
+    displayName: "📋 Terraform Plan"
+    dependsOn: Validate
+    condition: succeeded()
+
+    jobs:
+      - job: TerraformPlan
+        displayName: "terraform plan"
+        pool:
+          vmImage: "ubuntu-latest"
+
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - task: TerraformInstaller@1
+            displayName: "Install Terraform"
+            inputs:
+              terraformVersion: ${{ parameters.terraformVersion }}
+
+          - task: AzureCLI@2
+            displayName: "terraform init"
+            inputs:
+              azureSubscription: $(SERVICE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                # Export ARM credentials from Service Principal (for Terraform provider)
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_CLIENT_SECRET=$servicePrincipalKey
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(TF_VAR_subscription_id)
+
+                terraform init \
+                  -backend-config="resource_group_name=$(TF_BACKEND_RG)" \
+                  -backend-config="storage_account_name=$(TF_BACKEND_SA)" \
+                  -backend-config="container_name=$(TF_BACKEND_CONTAINER)" \
+                  -backend-config="key=$(TF_STATE_KEY)" \
+                  -input=false
+            workingDirectory: $(TF_WORKING_DIR)
+
+          - task: AzureCLI@2
+            displayName: "terraform plan"
+            inputs:
+              azureSubscription: $(SERVICE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_CLIENT_SECRET=$servicePrincipalKey
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(TF_VAR_subscription_id)
+
+                terraform plan \
+                  -var-file="$(TF_VARFILE)" \
+                  -var="subscription_id=$(TF_VAR_subscription_id)" \
+                  -out=tfplan \
+                  -input=false
+            workingDirectory: $(TF_WORKING_DIR)
+
+          # Publish plan artifact so Apply stage can consume it
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish tfplan artifact"
+            inputs:
+              targetPath: "$(TF_WORKING_DIR)/tfplan"
+              artifact: "tfplan-${{ parameters.environment }}"
+              publishLocation: "pipeline"
+
+  ###########################################################################
+  # STAGE 3 – Apply (manual approval gate on prod)
+  ###########################################################################
+  - stage: Apply
+    displayName: "🚀 Terraform Apply"
+    dependsOn: Plan
+    condition: |
+      and(
+        succeeded(),
+        or(
+          eq('${{ parameters.action }}', 'apply'),
+          eq('${{ parameters.action }}', 'destroy')
+        )
+      )
+
+    jobs:
+      # Approval gate – only on staging and prod
+      - ${{ if or(eq(parameters.environment, 'prod'), eq(parameters.environment, 'staging')) }}:
+        - job: ManualApproval
+          displayName: "⏸ Manual Approval Required"
+          pool: server
+          timeoutInMinutes: 60
+          steps:
+            - task: ManualValidation@0
+              displayName: "Approve Terraform ${{ parameters.action }} on ${{ parameters.environment }}"
+              inputs:
+                notifyUsers: |
+                  ops@flow64.dev
+                instructions: |
+                  Please review the Terraform plan artifact before approving the
+                  ${{ parameters.action }} on the **${{ parameters.environment }}** environment.
+
+                  Verify in the pipeline artifacts tab:
+                  - Resources being created / modified / destroyed
+                  - No unexpected changes
+                onTimeout: "reject"
+
+      - job: TerraformApply
+        displayName: "terraform ${{ parameters.action }}"
+        pool:
+          vmImage: "ubuntu-latest"
+        ${{ if or(eq(parameters.environment, 'prod'), eq(parameters.environment, 'staging')) }}:
+          dependsOn: ManualApproval
+          condition: succeeded()
+
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - task: TerraformInstaller@1
+            displayName: "Install Terraform"
+            inputs:
+              terraformVersion: ${{ parameters.terraformVersion }}
+
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download tfplan artifact"
+            inputs:
+              artifact: "tfplan-${{ parameters.environment }}"
+              path: "$(TF_WORKING_DIR)"
+
+          - task: AzureCLI@2
+            displayName: "terraform init"
+            inputs:
+              azureSubscription: $(SERVICE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_CLIENT_SECRET=$servicePrincipalKey
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(TF_VAR_subscription_id)
+
+                terraform init \
+                  -backend-config="resource_group_name=$(TF_BACKEND_RG)" \
+                  -backend-config="storage_account_name=$(TF_BACKEND_SA)" \
+                  -backend-config="container_name=$(TF_BACKEND_CONTAINER)" \
+                  -backend-config="key=$(TF_STATE_KEY)" \
+                  -input=false
+            workingDirectory: $(TF_WORKING_DIR)
+
+          - task: AzureCLI@2
+            displayName: "terraform ${{ parameters.action }}"
+            inputs:
+              azureSubscription: $(SERVICE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_CLIENT_SECRET=$servicePrincipalKey
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(TF_VAR_subscription_id)
+
+                if [ "${{ parameters.action }}" = "destroy" ]; then
+                  terraform destroy \
+                    -var-file="$(TF_VARFILE)" \
+                    -var="subscription_id=$(TF_VAR_subscription_id)" \
+                    -auto-approve \
+                    -input=false
+                else
+                  terraform apply \
+                    -input=false \
+                    tfplan
+                fi
+            workingDirectory: $(TF_WORKING_DIR)
+
+          # Capture outputs and publish as pipeline variables / artifact
+          - task: AzureCLI@2
+            displayName: "Capture Terraform outputs"
+            inputs:
+              azureSubscription: $(SERVICE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_CLIENT_SECRET=$servicePrincipalKey
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(TF_VAR_subscription_id)
+
+                echo "=== Infrastructure Outputs ==="
+                terraform output -json | tee $(Build.ArtifactStagingDirectory)/tf-outputs.json
+
+                AGW_IP=$(terraform output -raw app_gateway_public_ip)
+                echo "##vso[task.setvariable variable=AGW_PUBLIC_IP;isOutput=true]$AGW_IP"
+                echo "App Gateway Public IP: $AGW_IP"
+            workingDirectory: $(TF_WORKING_DIR)
+            name: TfOutputs
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish tf-outputs artifact"
+            inputs:
+              targetPath: "$(Build.ArtifactStagingDirectory)/tf-outputs.json"
+              artifact: "tf-outputs-${{ parameters.environment }}"
+
+  ###########################################################################
+  # STAGE 4 – Smoke Test (runs after Apply on non-destroy actions)
+  ###########################################################################
+  - stage: SmokeTest
+    displayName: "🧪 Smoke Test"
+    dependsOn: Apply
+    condition: |
+      and(
+        succeeded(),
+        eq('${{ parameters.action }}', 'apply')
+      )
+
+    jobs:
+      - job: HttpCheck
+        displayName: "HTTP health check via App Gateway"
+        pool:
+          vmImage: "ubuntu-latest"
+
+        steps:
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download tf-outputs"
+            inputs:
+              artifact: "tf-outputs-${{ parameters.environment }}"
+              path: "$(Pipeline.Workspace)/tf-outputs"
+
+          - script: |
+              AGW_IP=$(cat $(Pipeline.Workspace)/tf-outputs/tf-outputs.json | python3 -c "import sys,json; print(json.load(sys.stdin)['app_gateway_public_ip']['value'])")
+              echo "Testing App Gateway at http://$AGW_IP/status/200"
+
+              # Retry up to 10 times (AGW provisioning can take a few minutes)
+              for i in $(seq 1 10); do
+                STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://$AGW_IP/status/200" || echo "000")
+                echo "Attempt $i: HTTP $STATUS"
+                if [ "$STATUS" = "200" ]; then
+                  echo "✅ Smoke test passed"
+                  exit 0
+                fi
+                sleep 30
+              done
+
+              echo "❌ Smoke test failed after 10 attempts"
+              exit 1
+            displayName: "HTTP smoke test"

@@ -1,0 +1,25 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Sensitive variable files – never commit real values
+*.auto.tfvars
+!terraform.dev.tfvars
+!terraform.prod.tfvars
+
+# Local overrides
+.env
+*.local
+
+# OS
+.DS_Store
+Thumbs.db
