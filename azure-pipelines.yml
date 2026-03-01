@@ -145,10 +145,12 @@ stages:
           - checkout: self
             fetchDepth: 1
 
-          - task: TerraformInstaller@1
+          - script: |
+              curl -sLo /tmp/terraform.zip "https://releases.hashicorp.com/terraform/${{ parameters.terraformVersion }}/terraform_${{ parameters.terraformVersion }}_linux_amd64.zip"
+              unzip -q /tmp/terraform.zip -d /tmp
+              sudo mv /tmp/terraform /usr/local/bin/terraform
+              terraform version
             displayName: "Install Terraform ${{ parameters.terraformVersion }}"
-            inputs:
-              terraformVersion: ${{ parameters.terraformVersion }}
 
           # fmt -check exits non-zero if any file isn't formatted.
           # This enforces consistent style across the team without manual reviews.
@@ -224,10 +226,12 @@ stages:
           - checkout: self
             fetchDepth: 1
 
-          - task: TerraformInstaller@1
-            displayName: "Install Terraform"
-            inputs:
-              terraformVersion: ${{ parameters.terraformVersion }}
+          - script: |
+              curl -sLo /tmp/terraform.zip "https://releases.hashicorp.com/terraform/${{ parameters.terraformVersion }}/terraform_${{ parameters.terraformVersion }}_linux_amd64.zip"
+              unzip -q /tmp/terraform.zip -d /tmp
+              sudo mv /tmp/terraform /usr/local/bin/terraform
+              terraform version
+            displayName: "Install Terraform ${{ parameters.terraformVersion }}"
 
           - task: AzureCLI@2
             displayName: "terraform init"
@@ -356,10 +360,12 @@ stages:
           - checkout: self
             fetchDepth: 1
 
-          - task: TerraformInstaller@1
-            displayName: "Install Terraform"
-            inputs:
-              terraformVersion: ${{ parameters.terraformVersion }}
+          - script: |
+              curl -sLo /tmp/terraform.zip "https://releases.hashicorp.com/terraform/${{ parameters.terraformVersion }}/terraform_${{ parameters.terraformVersion }}_linux_amd64.zip"
+              unzip -q /tmp/terraform.zip -d /tmp
+              sudo mv /tmp/terraform /usr/local/bin/terraform
+              terraform version
+            displayName: "Install Terraform ${{ parameters.terraformVersion }}"
 
           # Download the plan artifact from Stage 2. This runs on a fresh agent,
           # so nothing from the Plan stage's filesystem is available — we must
