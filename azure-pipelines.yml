@@ -36,7 +36,8 @@ trigger:
       - main
   paths:
     include:
-      - terraform/**
+      - "*.tf"
+      - "*.tfvars"
 
 # Trigger on PRs targeting main — runs Validate + Plan only (no Apply).
 # This gives reviewers a plan diff in the pipeline artifacts before merging.
@@ -46,7 +47,8 @@ pr:
       - main
   paths:
     include:
-      - terraform/**
+      - "*.tf"
+      - "*.tfvars"
 
 ###############################################################################
 # Global parameters
@@ -89,7 +91,7 @@ parameters:
 ###############################################################################
 variables:
   - name: TF_WORKING_DIR
-    value: "$(Build.SourcesDirectory)/terraform"
+    value: "$(Build.SourcesDirectory)"
 
   # Selects the correct .tfvars file for the target environment.
   # e.g., "terraform.dev.tfvars" for dev, "terraform.prod.tfvars" for prod.
@@ -153,7 +155,6 @@ stages:
           - script: |
               terraform fmt -check -recursive
             displayName: "terraform fmt check"
-            workingDirectory: $(TF_WORKING_DIR)
 
           # terraform validate requires init (to download providers), but we
           # don't need ARM credentials here — just backend connectivity to
@@ -172,7 +173,6 @@ stages:
                   -backend-config="container_name=$(TF_BACKEND_CONTAINER)" \
                   -backend-config="key=$(TF_STATE_KEY)" \
                   -input=false
-            workingDirectory: $(TF_WORKING_DIR)
 
           # Validates HCL syntax, provider requirements, and variable references.
           # Catches errors like missing required variables or invalid resource types
@@ -180,7 +180,6 @@ stages:
           - script: |
               terraform validate
             displayName: "terraform validate"
-            workingDirectory: $(TF_WORKING_DIR)
 
           # tfsec scans for security misconfigurations (e.g., public storage accounts,
           # missing encryption, overly permissive NSGs). continueOnError=true means
@@ -190,7 +189,6 @@ stages:
               curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
               tfsec . --format lovely --no-color
             displayName: "tfsec security scan"
-            workingDirectory: $(TF_WORKING_DIR)
             continueOnError: true
 
   ###########################################################################
@@ -253,7 +251,6 @@ stages:
                   -backend-config="container_name=$(TF_BACKEND_CONTAINER)" \
                   -backend-config="key=$(TF_STATE_KEY)" \
                   -input=false
-            workingDirectory: $(TF_WORKING_DIR)
 
           - task: AzureCLI@2
             displayName: "terraform plan"
@@ -276,7 +273,6 @@ stages:
                   -var="subscription_id=$(TF_VAR_subscription_id)" \
                   -out=tfplan \
                   -input=false
-            workingDirectory: $(TF_WORKING_DIR)
 
           # Publish the binary plan as a pipeline artifact so the Apply stage
           # (which runs on a fresh agent) can download and apply it.
@@ -393,7 +389,6 @@ stages:
                   -backend-config="container_name=$(TF_BACKEND_CONTAINER)" \
                   -backend-config="key=$(TF_STATE_KEY)" \
                   -input=false
-            workingDirectory: $(TF_WORKING_DIR)
 
           - task: AzureCLI@2
             displayName: "terraform ${{ parameters.action }}"
@@ -425,7 +420,6 @@ stages:
                     -input=false \
                     tfplan
                 fi
-            workingDirectory: $(TF_WORKING_DIR)
 
           # After apply, capture Terraform outputs as both:
           # 1. A JSON artifact (for the Smoke Test stage to read the AGW IP)
@@ -452,7 +446,6 @@ stages:
                 AGW_IP=$(terraform output -raw app_gateway_public_ip)
                 echo "##vso[task.setvariable variable=AGW_PUBLIC_IP;isOutput=true]$AGW_IP"
                 echo "App Gateway Public IP: $AGW_IP"
-            workingDirectory: $(TF_WORKING_DIR)
             name: TfOutputs
 
           - task: PublishPipelineArtifact@1
